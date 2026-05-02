@@ -90,7 +90,7 @@ export class ActionDispatcher {
     const base = await this.defaultBranch();
     const branchName = `${BRANCH_PREFIX}/fix-issue-${issueNumber}`;
 
-    await sandbox.execChecked(`git checkout -b ${shellSingleQuote(branchName)}`);
+    await sandbox.execChecked(`git checkout -B ${shellSingleQuote(branchName)}`);
     await sandbox.execChecked(`git config user.email ${shellSingleQuote(BOT_EMAIL)}`);
     await sandbox.execChecked(`git config user.name ${shellSingleQuote(BOT_NAME)}`);
     await sandbox.formatCode();
@@ -131,7 +131,7 @@ export class ActionDispatcher {
     const base = await this.defaultBranch();
     const branchName = `${BRANCH_PREFIX}/draft-fix-issue-${issueNumber}`;
 
-    await sandbox.execChecked(`git checkout -b ${shellSingleQuote(branchName)}`);
+    await sandbox.execChecked(`git checkout -B ${shellSingleQuote(branchName)}`);
     await sandbox.execChecked(`git config user.email ${shellSingleQuote(BOT_EMAIL)}`);
     await sandbox.execChecked(`git config user.name ${shellSingleQuote(BOT_NAME)}`);
     await sandbox.formatCode();
