@@ -122,6 +122,12 @@ export class SandboxExecutor {
     await this.sandbox.files.write(resolved, content);
   }
 
+  async readFile(relPath: string): Promise<string> {
+    if (!this.sandbox) throw new Error("Sandbox not booted");
+    const resolved = this.resolveRepoPath(relPath);
+    return await this.sandbox.files.read(resolved);
+  }
+
   /** Remove a file and track it as a modification. */
   async removeFile(relPath: string): Promise<string> {
     const resolved = this.resolveRepoPath(relPath);

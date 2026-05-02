@@ -1,10 +1,13 @@
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { randomUUID } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Webhooks } from "@octokit/webhooks";
 import { createGithubWebhooks } from "./webhooks/github.js";
 import { createIssueQueue } from "./queue/issueQueue.js";
 import { logger } from "./utils/logger.js";
+import { setInstallationPlan } from "./billing/plans.js";
+import type { PlanTier } from "./billing/plans.js";
 
 export async function startApiServer(): Promise<void> {
   const app = express();
@@ -102,6 +105,61 @@ export async function startApiServer(): Promise<void> {
       });
     });
   }
+
+  // Marketplace billing webhook — plan purchases, cancellations, changes
+  app.post(
+    "/marketplace",
+    express.raw({ type: "*/*", limit: "1mb" }),
+    async (req: Request, res: Response) => {
+      const secret = process.env.WEBHOOK_SECRET;
+      const sig = req.headers["x-hub-signature-256"] as string | undefined;
+      const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body ?? "", "utf8");
+
+      // Verify signature if secret is configured
+      if (secret && sig) {
+        const expected = "sha256=" + createHmac("sha256", secret).update(raw).digest("hex");
+        try {
+          if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+            res.status(401).json({ error: "invalid signature" });
+            return;
+          }
+        } catch {
+          res.status(401).json({ error: "invalid signature" });
+          return;
+        }
+      }
+
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(raw.toString("utf8"));
+      } catch {
+        res.status(400).json({ error: "invalid json" });
+        return;
+      }
+
+      const action = payload["action"] as string | undefined;
+      const account = payload["marketplace_purchase"] as Record<string, unknown> | undefined;
+      const installationId = account?.["account"] as Record<string, unknown> | undefined;
+      const planId = (account?.["plan"] as Record<string, unknown> | undefined)?.["monthly_price_in_cents"] as number | undefined;
+
+      logger.info({ action, installationId, planId }, "Marketplace event received");
+
+      // Map GitHub plan price → our tier
+      if (action && installationId) {
+        const id = installationId["id"] as number | undefined;
+        if (id) {
+          const tier: PlanTier = planId && planId > 0 ? "paid" : "free";
+          if (action === "cancelled" || action === "pending_cancellation") {
+            await setInstallationPlan(id, "free").catch(() => {});
+          } else if (["purchased", "changed", "pending_change"].includes(action)) {
+            await setInstallationPlan(id, tier).catch(() => {});
+          }
+        }
+      }
+
+      res.status(200).json({ ok: true });
+    }
+  );
 
   const port = Number(process.env.PORT ?? 3000);
 

@@ -157,8 +157,11 @@ export function buildTools(ctx: ToolContext): InternalTool[] {
       },
       handler: async input => {
         const p = String(input.path);
-        ctx.sandbox.validateRepoPath(p);
-        return ctx.sandbox.execForTools(`cat ${sh(p)} 2>&1 || echo FILE_NOT_FOUND`);
+        try {
+          return await ctx.sandbox.readFile(p);
+        } catch {
+          return "FILE_NOT_FOUND";
+        }
       },
     },
     {
@@ -175,10 +178,16 @@ export function buildTools(ctx: ToolContext): InternalTool[] {
       },
       handler: async input => {
         const p = String(input.path);
-        ctx.sandbox.validateRepoPath(p);
         const start = Math.max(1, Number(input.start_line));
         const end = Math.max(start, Number(input.end_line));
-        return ctx.sandbox.execForTools(`sed -n '${start},${end}p' ${sh(p)} 2>&1 || echo FILE_NOT_FOUND`);
+        try {
+          const current = await ctx.sandbox.readFile(p);
+          const isCRLF = current.includes("\r\n");
+          const lines = current.split(isCRLF ? "\r\n" : "\n");
+          return lines.slice(start - 1, end).join("\n");
+        } catch {
+          return "FILE_NOT_FOUND";
+        }
       },
     },
     {
@@ -415,10 +424,14 @@ export function buildTools(ctx: ToolContext): InternalTool[] {
       },
       handler: async input => {
         const filePath = String(input.path);
-        ctx.sandbox.validateRepoPath(filePath);
         const oldContent = String(input.old_content);
         const newContent = String(input.new_content);
-        const current = await ctx.sandbox.execForTools(`cat ${sh(filePath)}`);
+        let current: string;
+        try {
+          current = await ctx.sandbox.readFile(filePath);
+        } catch {
+          return `ERROR: File not found ${filePath}`;
+        }
         if (!current.includes(oldContent)) {
           return `ERROR: old_content not found in ${filePath}. Read the file first and match exactly. If this keeps failing, use replace_lines instead.`;
         }
@@ -441,13 +454,25 @@ export function buildTools(ctx: ToolContext): InternalTool[] {
       },
       handler: async input => {
         const filePath = String(input.path);
-        ctx.sandbox.validateRepoPath(filePath);
         const start = Math.max(1, Number(input.start_line));
         const end = Math.max(start, Number(input.end_line));
-        const current = await ctx.sandbox.execForTools(`cat ${sh(filePath)}`);
-        const lines = current.split("\n");
+        let current: string;
+        try {
+          current = await ctx.sandbox.readFile(filePath);
+        } catch {
+          return `ERROR: File not found ${filePath}`;
+        }
+        
+        // Handle CRLF or LF gracefully
+        const isCRLF = current.includes("\r\n");
+        const lines = current.split(isCRLF ? "\r\n" : "\n");
+        
         if (start > lines.length) return `ERROR: start_line ${start} exceeds file length (${lines.length}).`;
-        const updated = [...lines.slice(0, start - 1), String(input.new_content), ...lines.slice(end)].join("\n");
+        
+        const newLines = String(input.new_content).split(/\r?\n/);
+        const updatedLines = [...lines.slice(0, start - 1), ...newLines, ...lines.slice(end)];
+        const updated = updatedLines.join(isCRLF ? "\r\n" : "\n");
+        
         await ctx.sandbox.writeFile(filePath, updated);
         return `Replaced lines ${start}-${end} in ${filePath}`;
       },
@@ -462,8 +487,12 @@ export function buildTools(ctx: ToolContext): InternalTool[] {
       },
       handler: async input => {
         const filePath = String(input.path);
-        ctx.sandbox.validateRepoPath(filePath);
-        const current = await ctx.sandbox.execForTools(`cat ${sh(filePath)}`);
+        let current: string;
+        try {
+          current = await ctx.sandbox.readFile(filePath);
+        } catch {
+          current = "";
+        }
         const needsNewline = current.length > 0 && !current.endsWith("\n");
         await ctx.sandbox.writeFile(filePath, current + (needsNewline ? "\n" : "") + String(input.content));
         return `Appended to ${filePath}`;
