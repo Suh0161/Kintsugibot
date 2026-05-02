@@ -94,7 +94,12 @@ export class ActionDispatcher {
     await sandbox.execChecked(`git config user.email ${shellSingleQuote(BOT_EMAIL)}`);
     await sandbox.execChecked(`git config user.name ${shellSingleQuote(BOT_NAME)}`);
     await sandbox.formatCode();
-    await this.commitOnly(result.changedPaths ?? [], this.buildCommitMessage(issueNumber, issueTitle, result), sandbox);
+    const committed = await this.commitOnly(result.changedPaths ?? [], this.buildCommitMessage(issueNumber, issueTitle, result), sandbox);
+    if (!committed) {
+      logger.warn({ issueNumber }, "Nothing to commit after staging — falling back to investigation comment");
+      await this.postInvestigationFindings(issueNumber, result);
+      return;
+    }
     await sandbox.pushBranch(branchName);
 
     const title = this.buildPRTitle(issueNumber, issueTitle, result, false);
@@ -135,7 +140,12 @@ export class ActionDispatcher {
     await sandbox.execChecked(`git config user.email ${shellSingleQuote(BOT_EMAIL)}`);
     await sandbox.execChecked(`git config user.name ${shellSingleQuote(BOT_NAME)}`);
     await sandbox.formatCode();
-    await this.commitOnly(result.changedPaths ?? [], this.buildCommitMessage(issueNumber, issueTitle, result), sandbox);
+    const committed = await this.commitOnly(result.changedPaths ?? [], this.buildCommitMessage(issueNumber, issueTitle, result), sandbox);
+    if (!committed) {
+      logger.warn({ issueNumber }, "Nothing to commit after staging — falling back to investigation comment");
+      await this.postInvestigationFindings(issueNumber, result);
+      return;
+    }
     await sandbox.pushBranch(branchName);
 
     const title = this.buildPRTitle(issueNumber, issueTitle, result, true);
@@ -248,8 +258,8 @@ export class ActionDispatcher {
     }
   }
 
-  /** Reset any unintended working-tree changes and commit only the specified paths. */
-  private async commitOnly(paths: string[], message: string, sandbox: SandboxExecutor): Promise<void> {
+  /** Reset any unintended working-tree changes and commit only the specified paths. Returns false if nothing was staged. */
+  private async commitOnly(paths: string[], message: string, sandbox: SandboxExecutor): Promise<boolean> {
     const keep = new Set(paths);
 
     // Discard tracked modifications that aren't in our intended set
@@ -273,7 +283,14 @@ export class ActionDispatcher {
       await sandbox.execChecked(`git add ${shellSingleQuote(p)}`, 10);
     }
 
+    // Check if there's actually anything staged — git commit exits 1 with nothing to commit
+    const statusResult = await sandbox.exec("git diff --cached --name-only", 10);
+    if (!statusResult.stdout.trim()) {
+      return false; // caller should treat as no-op
+    }
+
     await sandbox.execChecked(`git commit -m ${shellSingleQuote(message)}`, 30);
+    return true;
   }
 
   private buildCommitMessage(issueNumber: number, issueTitle: string, result: AgentResult): string {
