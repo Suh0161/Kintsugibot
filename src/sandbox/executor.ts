@@ -47,6 +47,7 @@ export class SandboxExecutor {
     const authedCloneUrl = `https://x-access-token:${this.githubToken}@github.com/${this.repoOwner}/${this.repoName}.git`;
     const cleanRemoteUrl = `https://github.com/${this.repoOwner}/${this.repoName}.git`;
 
+    await this.sandbox.commands.run("mkdir -p /repo");
     await this.execChecked(`git clone ${shellSingleQuote(authedCloneUrl)} /repo --depth=50`, 120);
     // Strip token from remote so the LLM can't extract it via git remote -v
     await this.execChecked(`git -C /repo remote set-url origin ${shellSingleQuote(cleanRemoteUrl)}`, 30);
