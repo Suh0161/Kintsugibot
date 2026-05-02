@@ -15,6 +15,7 @@ import {
   noFixComment,
   noResultComment,
   investigationComment,
+  alreadyFixedComment,
   ciFailureComment,
   buildPRBody,
 } from "./messages.js";
@@ -96,8 +97,8 @@ export class ActionDispatcher {
     await sandbox.formatCode();
     const committed = await this.commitOnly(result.changedPaths ?? [], this.buildCommitMessage(issueNumber, issueTitle, result), sandbox);
     if (!committed) {
-      logger.warn({ issueNumber }, "Nothing to commit after staging — falling back to investigation comment");
-      await this.postInvestigationFindings(issueNumber, result);
+      logger.warn({ issueNumber }, "Nothing to commit after staging — issue appears already fixed");
+      await this.postAlreadyFixed(issueNumber, result);
       return;
     }
     await sandbox.pushBranch(branchName);
@@ -142,8 +143,8 @@ export class ActionDispatcher {
     await sandbox.formatCode();
     const committed = await this.commitOnly(result.changedPaths ?? [], this.buildCommitMessage(issueNumber, issueTitle, result), sandbox);
     if (!committed) {
-      logger.warn({ issueNumber }, "Nothing to commit after staging — falling back to investigation comment");
-      await this.postInvestigationFindings(issueNumber, result);
+      logger.warn({ issueNumber }, "Nothing to commit after staging — issue appears already fixed");
+      await this.postAlreadyFixed(issueNumber, result);
       return;
     }
     await sandbox.pushBranch(branchName);
@@ -201,6 +202,15 @@ export class ActionDispatcher {
       repo: this.repoName,
       issue_number: issueNumber,
       body: noResultComment(),
+    });
+  }
+
+  private async postAlreadyFixed(issueNumber: number, result: AgentResult) {
+    await this.octokit.issues.createComment({
+      owner: this.repoOwner,
+      repo: this.repoName,
+      issue_number: issueNumber,
+      body: alreadyFixedComment(result),
     });
   }
 

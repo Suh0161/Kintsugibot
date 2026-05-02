@@ -69,6 +69,13 @@ export function investigationComment(summary: string): string {
   return `**Investigation Results**\n\n${summary}\n\n${BOT_SIGNATURE}`;
 }
 
+/* ───────── Issue already fixed in codebase ───────── */
+
+export function alreadyFixedComment(result: { what?: string; why?: string; summary: string }): string {
+  const analysis = buildAnalysis(result);
+  return `**This issue appears to already be resolved.**\n\n${analysis}\n\nI investigated the codebase and the changes needed are already in place — no further changes were required. Feel free to close this issue if everything looks good.\n\n${BOT_SIGNATURE}`;
+}
+
 /* ───────── Error comment ───────── */
 
 export function errorComment(message: string): string {
