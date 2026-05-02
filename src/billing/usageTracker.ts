@@ -34,7 +34,7 @@ export async function getUsage(installationId: number): Promise<number> {
 /**
  * Check if the installation is within its plan limits.
  *
- * Free plan: public repos only, 20 issues/month, no repo cap.
+ * Free plan: public repos only, 10 issues/month, no repo cap.
  * Paid plan ($5/mo): public + private, 100 issues/month, max 10 repos.
  */
 export async function checkLimit(

@@ -47,7 +47,7 @@ export function createIssueWorker() {
         throw err;
       }
     },
-    { connection, concurrency: Number(process.env.WORKER_CONCURRENCY ?? 2) }
+    { connection, concurrency: Math.max(1, parseInt(process.env.WORKER_CONCURRENCY ?? "2", 10) || 2) }
   );
 
   worker.on("completed", job => {
