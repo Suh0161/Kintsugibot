@@ -1,7 +1,5 @@
-import Docker from "dockerode";
+import { Sandbox } from "e2b";
 import path from "node:path";
-import crypto from "node:crypto";
-import tar from "tar-stream";
 import { logger } from "../utils/logger.js";
 import { shellSingleQuote } from "../utils/shell.js";
 import type { TestResult } from "../agent/types.js";
@@ -23,220 +21,54 @@ interface SandboxOptions {
 }
 
 export class SandboxExecutor {
-  private docker: Docker;
-  private container: Docker.Container | null = null;
+  private sandbox: Sandbox | null = null;
   private repoOwner: string;
   private repoName: string;
   private githubToken: string;
   private timeoutMs: number;
   private runtime = "unknown";
-  private shellReady = false;
   /** Tracks files the bot explicitly touched so format_code only targets them. */
   private modifiedFiles = new Set<string>();
-  /** Random token for shell server file paths — prevents LLM from hijacking the command file. */
-  private shellToken = crypto.randomBytes(16).toString("hex");
 
   constructor(opts: SandboxOptions) {
-    this.docker = new Docker();
     this.repoOwner = opts.repoOwner;
     this.repoName = opts.repoName;
     this.githubToken = opts.githubToken;
     this.timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
   }
 
-  /** Build the persistent shell server script with randomized file paths. */
-  private buildCmdServer(): string {
-    return `
-const fs = require("fs");
-const { exec } = require("child_process");
-
-const CMD_FILE = "/tmp/.kintsugi_cmd_${this.shellToken}";
-const OUT_FILE = "/tmp/.kintsugi_out_${this.shellToken}";
-const READY_FILE = "/tmp/.kintsugi_ready_${this.shellToken}";
-
-function poll() {
-  try {
-    if (fs.existsSync(CMD_FILE)) {
-      const cmd = fs.readFileSync(CMD_FILE, "utf8");
-      fs.unlinkSync(CMD_FILE);
-      exec(cmd, { cwd: "/repo", maxBuffer: 50 * 1024 * 1024, env: { ...process.env, CI: "true", FORCE_COLOR: "0" } }, (err, stdout, stderr) => {
-        const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
-        fs.writeFileSync(OUT_FILE, JSON.stringify({ stdout, stderr, code }));
-        setTimeout(poll, 10);
-      });
-      return;
-    }
-  } catch (e) {}
-  setTimeout(poll, 10);
-}
-
-fs.writeFileSync(READY_FILE, "1");
-poll();
-`;
-  }
-
   async boot() {
     logger.info({ repo: `${this.repoOwner}/${this.repoName}` }, "Booting sandbox");
 
-    this.container = await this.docker.createContainer({
-      Image: "issuebot-sandbox:latest",
-      Cmd: ["/bin/bash", "-c", "sleep infinity"],
-      WorkingDir: "/repo",
-      HostConfig: {
-        Memory: 2 * 1024 * 1024 * 1024,
-        CpuPeriod: 100000,
-        CpuQuota: 200000,
-        NetworkMode: "bridge",
-        AutoRemove: false,
-        Binds: [
-          "issuebot-npm-cache:/root/.npm",
-          "issuebot-pip-cache:/root/.cache/pip",
-          "issuebot-cargo-cache:/root/.cargo",
-          "issuebot-go-cache:/root/go/pkg/mod",
-        ],
-      },
-      Env: [`GITHUB_REPO=${this.repoOwner}/${this.repoName}`],
+    this.sandbox = await Sandbox.create({
+      timeoutMs: this.timeoutMs,
     });
-
-    await this.container.start();
 
     const authedCloneUrl = `https://x-access-token:${this.githubToken}@github.com/${this.repoOwner}/${this.repoName}.git`;
     const cleanRemoteUrl = `https://github.com/${this.repoOwner}/${this.repoName}.git`;
 
-    // Use one-off exec for setup before the persistent shell is ready
-    await this.rawExec(`git clone ${shellSingleQuote(authedCloneUrl)} /repo --depth=50`, 120);
-    // Strip token from remote URL so the LLM can't extract it via git remote -v
-    await this.rawExec(`git remote set-url origin ${shellSingleQuote(cleanRemoteUrl)}`, 30);
+    await this.execChecked(`git clone ${shellSingleQuote(authedCloneUrl)} /repo --depth=50`, 120);
+    // Strip token from remote so the LLM can't extract it via git remote -v
+    await this.execChecked(`git -C /repo remote set-url origin ${shellSingleQuote(cleanRemoteUrl)}`, 30);
 
     this.runtime = await this.detectRuntime();
     logger.info({ runtime: this.runtime }, "Runtime detected");
 
     await this.installDeps();
-
-    // Start the persistent command server with randomized file paths
-    const cmdFile = `/tmp/.kintsugi_cmd_${this.shellToken}`;
-    const outFile = `/tmp/.kintsugi_out_${this.shellToken}`;
-    const readyFile = `/tmp/.kintsugi_ready_${this.shellToken}`;
-    const serverFile = `/tmp/.kintsugi_server_${this.shellToken}.js`;
-    await this.rawExec(`rm -f ${shellSingleQuote(cmdFile)} ${shellSingleQuote(outFile)} ${shellSingleQuote(readyFile)} ${shellSingleQuote(serverFile)}`, 10);
-    const b64 = Buffer.from(this.buildCmdServer()).toString("base64");
-    await this.rawExec(`echo ${b64} | base64 -d > ${shellSingleQuote(serverFile)}`, 5);
-    await this.rawExec(`nohup node ${shellSingleQuote(serverFile)} > /dev/null 2>&1 &`, 5);
-
-    // Wait for server to be ready
-    for (let i = 0; i < 50; i++) {
-      const ready = await this.rawExec(`cat ${shellSingleQuote(readyFile)} 2>/dev/null || true`, 1);
-      if (ready.stdout.includes("1")) {
-        this.shellReady = true;
-        break;
-      }
-      await new Promise(r => setTimeout(r, 100));
-    }
-
-    if (!this.shellReady) {
-      throw new Error("Persistent shell failed to start");
-    }
-
-    logger.info("Persistent shell ready");
+    logger.info("Sandbox ready");
   }
 
-  /** Execute a command through the persistent shell. */
   async exec(command: string, timeoutSeconds = 60): Promise<ExecResult> {
-    if (!this.container || !this.shellReady) {
-      throw new Error("Sandbox not booted");
-    }
-
-    const outFile = `/tmp/.kintsugi_out_${this.shellToken}`;
-    const cmdFile = `/tmp/.kintsugi_cmd_${this.shellToken}`;
-
-    // Clear old output and write command atomically
-    await this.rawExec(`rm -f ${shellSingleQuote(outFile)}`, 2);
-    await this.rawExec(`printf '%s' ${shellSingleQuote(command)} > ${shellSingleQuote(cmdFile)}`, 2);
-
-    // Poll for output
-    const deadline = Date.now() + timeoutSeconds * 1000;
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 50));
-      const out = await this.rawExec(`cat ${shellSingleQuote(outFile)} 2>/dev/null || true`, 2);
-      if (out.stdout) {
-        try {
-          const parsed = JSON.parse(out.stdout) as { stdout: string; stderr: string; code: number };
-          return {
-            stdout: parsed.stdout.trim(),
-            stderr: parsed.stderr.trim(),
-            exitCode: parsed.code,
-          };
-        } catch {
-          // Output not ready yet, continue polling
-        }
-      }
-    }
-
-    throw new Error(`Command timed out: ${command.slice(0, 80)}`);
-  }
-
-  /** One-off exec for setup (before persistent shell is ready). */
-  private async rawExec(command: string, timeoutSeconds = 60): Promise<ExecResult> {
-    if (!this.container) throw new Error("Sandbox not booted");
-
-    const execInstance = await this.container.exec({
-      Cmd: ["/bin/bash", "-lc", command],
-      AttachStdout: true,
-      AttachStderr: true,
-      WorkingDir: "/repo",
+    if (!this.sandbox) throw new Error("Sandbox not booted");
+    const result = await this.sandbox.commands.run(command, {
+      cwd: "/repo",
+      timeoutMs: timeoutSeconds * 1000,
     });
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`Command timed out: ${command.slice(0, 80)}`));
-      }, timeoutSeconds * 1000);
-
-      execInstance.start({ hijack: true, stdin: false }, (err, stream) => {
-        if (err) {
-          clearTimeout(timer);
-          return reject(err);
-        }
-
-        let stdout = "";
-        let stderr = "";
-        let buf = Buffer.alloc(0);
-
-        stream!.on("data", (chunk: Buffer) => {
-          buf = Buffer.concat([buf, chunk]);
-          while (buf.length >= 8) {
-            const size = buf.readUInt32BE(4);
-            if (buf.length < 8 + size) break;
-            const type = buf[0];
-            const data = buf.subarray(8, 8 + size).toString();
-            if (type === 2) {
-              stderr += data;
-            } else {
-              stdout += data;
-            }
-            buf = buf.subarray(8 + size);
-          }
-        });
-
-        stream!.on("end", async () => {
-          clearTimeout(timer);
-          try {
-            const inspect = await execInstance.inspect();
-            resolve({
-              stdout: stdout.trim(),
-              stderr: stderr.trim(),
-              exitCode: inspect.ExitCode ?? -1,
-            });
-          } catch (e) {
-            reject(e);
-          }
-        });
-
-        stream!.on("error", (e: Error) => {
-          clearTimeout(timer);
-          reject(e);
-        });
-      });
-    });
+    return {
+      stdout: (result.stdout ?? "").trim(),
+      stderr: (result.stderr ?? "").trim(),
+      exitCode: result.exitCode ?? 0,
+    };
   }
 
   /** Convenience: returns stdout (and stderr on failure) for tool responses. */
@@ -247,7 +79,7 @@ poll();
     return `${tail}\n[exit code ${r.exitCode}]`.trim();
   }
 
-  /** Like exec() but throws if the command exits non-zero. Use for critical steps (git commit/push). */
+  /** Like exec() but throws if the command exits non-zero. */
   async execChecked(command: string, timeoutSeconds = 60): Promise<ExecResult> {
     const r = await this.exec(command, timeoutSeconds);
     if (r.exitCode !== 0) {
@@ -275,7 +107,7 @@ poll();
   }
 
   async writeFile(relPath: string, content: string) {
-    if (!this.container) throw new Error("Sandbox not booted");
+    if (!this.sandbox) throw new Error("Sandbox not booted");
 
     if (Buffer.byteLength(content, "utf8") > MAX_FILE_WRITE_BYTES) {
       throw new Error(`File write too large: ${relPath} exceeds ${MAX_FILE_WRITE_BYTES} bytes`);
@@ -285,20 +117,7 @@ poll();
     const repoRel = path.posix.relative("/repo", resolved);
     this.modifiedFiles.add(repoRel);
 
-    const dir = path.posix.dirname(resolved);
-    const filename = path.posix.basename(resolved);
-
-    try {
-      const pack = tar.pack();
-      pack.entry({ name: filename }, content);
-      pack.finalize();
-
-      await this.container.putArchive(pack, { path: dir });
-    } catch (err) {
-      throw new Error(
-        `Failed to write file ${relPath}: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
+    await this.sandbox.files.write(resolved, content);
   }
 
   /** Remove a file and track it as a modification. */
@@ -318,7 +137,7 @@ poll();
   /** Push a branch to origin without leaking the token in git remote -v. */
   async pushBranch(branchName: string): Promise<void> {
     const pushUrl = `https://x-access-token:${this.githubToken}@github.com/${this.repoOwner}/${this.repoName}.git`;
-    await this.execChecked(`git push -u ${shellSingleQuote(pushUrl)} ${shellSingleQuote(branchName)}`, 60);
+    await this.execChecked(`git -C /repo push -u ${shellSingleQuote(pushUrl)} ${shellSingleQuote(branchName)}`, 60);
   }
 
   async runTests(filter?: string): Promise<TestResult> {
@@ -328,72 +147,51 @@ poll();
     try {
       const result = await this.exec(testCmd, 300);
 
-      // Save full output so the bot can read it later if truncated in conversation
       const fullOutput = [result.stdout, result.stderr].filter(Boolean).join("\n");
       await this.exec(`printf '%s' ${shellSingleQuote(fullOutput)} > /tmp/last_test_output.txt`, 10);
 
-      // Detect when the repo simply has no tests — this is not a failure
       const noTestsIndicators = [
-        "no tests found",
-        "no test files found",
-        "could not find any test files",
-        "no test runner detected",
-        "no tests matched",
+        "no tests found", "no test files found", "could not find any test files",
+        "no test runner detected", "no tests matched",
       ];
       const outputLower = `${result.stdout} ${result.stderr}`.toLowerCase();
       const hasNoTests = noTestsIndicators.some(ind => outputLower.includes(ind));
 
       if (hasNoTests) {
         return {
-          allTestsPass: true,
-          issueReproducedBeforeFix: false,
-          issueResolvedAfterFix: true,
-          hasRegressions: false,
-          stdout: result.stdout,
-          stderr: result.stderr,
-          exitCode: 0,
+          allTestsPass: true, issueReproducedBeforeFix: false,
+          issueResolvedAfterFix: true, hasRegressions: false,
+          stdout: result.stdout, stderr: result.stderr, exitCode: 0,
         };
       }
 
       const passed = result.exitCode === 0;
-
       return {
-        allTestsPass: passed,
-        issueReproducedBeforeFix: false,
-        issueResolvedAfterFix: passed,
-        hasRegressions: !passed,
-        stdout: result.stdout,
-        stderr: result.stderr || `(exit ${result.exitCode})`,
+        allTestsPass: passed, issueReproducedBeforeFix: false,
+        issueResolvedAfterFix: passed, hasRegressions: !passed,
+        stdout: result.stdout, stderr: result.stderr || `(exit ${result.exitCode})`,
         exitCode: result.exitCode,
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return {
-        allTestsPass: false,
-        issueReproducedBeforeFix: false,
-        issueResolvedAfterFix: false,
-        hasRegressions: true,
-        stdout: message,
-        stderr: message,
-        exitCode: 1,
+        allTestsPass: false, issueReproducedBeforeFix: false,
+        issueResolvedAfterFix: false, hasRegressions: true,
+        stdout: message, stderr: message, exitCode: 1,
       };
     }
   }
 
-  /** Auto-detect and run the project's code formatter on ONLY files the bot touched. */
   async formatCode(): Promise<string> {
     const files = this.getModifiedFiles();
-    if (files.length === 0) {
-      return "No modified files to format";
-    }
+    if (files.length === 0) return "No modified files to format";
 
     const fileArgs = files.map(f => shellSingleQuote(f)).join(" ");
-
     const formatters: Record<string, string> = {
-      node: `npx prettier --write ${fileArgs} 2>&1 | tail -10 || npx eslint --fix ${fileArgs} 2>&1 | tail -10 || true`,
-      python: `(black ${fileArgs} 2>&1 || ruff format ${fileArgs} 2>&1 || autopep8 -i ${fileArgs} 2>&1) | tail -10 || true`,
+      node: `npx prettier --write ${fileArgs} 2>&1 | tail -10 || true`,
+      python: `(black ${fileArgs} 2>&1 || ruff format ${fileArgs} 2>&1) | tail -10 || true`,
       go: `gofmt -w ${fileArgs} 2>&1 || true`,
-      rust: `which rustfmt >/dev/null 2>&1 && rustfmt ${fileArgs} 2>&1 || echo "rustfmt not available, skipping"`,
+      rust: `rustfmt ${fileArgs} 2>&1 || true`,
       ruby: `rubocop -A ${fileArgs} 2>&1 | tail -10 || true`,
       java: "true",
       php: `php-cs-fixer fix ${fileArgs} 2>&1 | tail -10 || true`,
@@ -411,11 +209,10 @@ poll();
     return r.stdout || "(no output)";
   }
 
-  /** Run static analysis (type check / lint) and return errors found. */
   async analyzeCode(): Promise<string> {
     const analyzers: Record<string, string> = {
-      node: "npx tsc --noEmit 2>&1 | tail -30 || npx eslint . --ext .ts,.tsx,.js,.jsx 2>&1 | tail -30 || true",
-      python: "python -m py_compile $(find . -name '*.py' | head -20) 2>&1 | tail -20 || ruff check . 2>&1 | tail -20 || true",
+      node: "npx tsc --noEmit 2>&1 | tail -30 || true",
+      python: "ruff check . 2>&1 | tail -20 || python -m py_compile $(find . -name '*.py' | head -20) 2>&1 | tail -20 || true",
       go: "go vet ./... 2>&1 | tail -20 || true",
       rust: "cargo check 2>&1 | tail -30 || true",
       ruby: "bundle exec rubocop --format simple 2>&1 | tail -20 || true",
@@ -434,7 +231,6 @@ poll();
     try {
       const r = await this.exec(cmd, 120);
       const output = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
-      // Only return if there are actual errors
       if (r.exitCode !== 0 && output) return output;
       if (output && !output.includes("error") && !output.includes("Error") && !output.includes("warning")) return "";
       return output;
@@ -444,20 +240,19 @@ poll();
   }
 
   async destroy() {
-    if (!this.container) return;
+    if (!this.sandbox) return;
     try {
-      await this.container.stop({ t: 5 });
-      await this.container.remove();
+      await this.sandbox.kill();
       logger.info("Sandbox destroyed");
     } catch (err) {
       logger.warn({ err }, "Failed to cleanly destroy sandbox");
     }
-    this.container = null;
+    this.sandbox = null;
   }
 
   private async detectRuntime(): Promise<string> {
-    const ls = await this.rawExec("ls /repo");
-    const listing = ls.stdout;
+    const r = await this.exec("ls /repo");
+    const listing = r.stdout;
     if (listing.includes("package.json")) return "node";
     if (listing.includes("requirements.txt") || listing.includes("pyproject.toml")) return "python";
     if (listing.includes("go.mod")) return "go";
@@ -469,15 +264,14 @@ poll();
     if (listing.includes("pubspec.yaml")) return "dart";
     if (listing.includes("mix.exs")) return "elixir";
     if (listing.includes("CMakeLists.txt") || listing.includes("Makefile")) return "cpp";
-    if (listing.includes("*.csproj") || listing.includes("*.fsproj")) return "dotnet";
+    if (listing.includes(".csproj") || listing.includes(".fsproj")) return "dotnet";
     return "unknown";
   }
 
   private async installDeps() {
     const cmds: Record<string, string> = {
       node: "npm install --prefer-offline 2>&1 | tail -20",
-      python:
-        "(pip install -r requirements.txt || pip install -e .) 2>&1 | tail -20",
+      python: "(pip install -r requirements.txt || pip install -e .) 2>&1 | tail -20",
       go: "go mod download 2>&1 | tail -20",
       rust: "cargo fetch 2>&1 | tail -20",
       java: "true",
@@ -493,7 +287,7 @@ poll();
     const cmd = cmds[this.runtime];
     if (cmd) {
       logger.info({ runtime: this.runtime }, "Installing dependencies");
-      await this.rawExec(cmd, 180);
+      await this.exec(cmd, 180);
     }
   }
 
@@ -504,32 +298,17 @@ poll();
         return filter
           ? `npx jest --testNamePattern=${sh(filter)} 2>&1 || npx vitest run --reporter=verbose 2>&1`
           : `npx jest 2>&1 || npx vitest run 2>&1 || npm test 2>&1`;
-      case "python":
-        return filter ? `pytest -k ${sh(filter)} -v 2>&1` : `pytest -v 2>&1`;
-      case "go":
-        return filter ? `go test ./... -run ${sh(filter)} -v 2>&1` : `go test ./... 2>&1`;
-      case "rust":
-        return filter ? `cargo test ${sh(filter)} 2>&1` : `cargo test 2>&1`;
-      case "ruby":
-        return filter
-          ? `bundle exec rspec --example ${sh(filter)} 2>&1`
-          : `bundle exec rspec 2>&1`;
-      case "php":
-        return filter
-          ? `vendor/bin/phpunit --filter=${sh(filter)} 2>&1 || composer test 2>&1`
-          : `vendor/bin/phpunit 2>&1 || composer test 2>&1`;
-      case "swift":
-        return filter ? `swift test --filter ${sh(filter)} 2>&1` : `swift test 2>&1`;
-      case "dart":
-        return filter ? `dart test --name=${sh(filter)} 2>&1` : `dart test 2>&1`;
-      case "elixir":
-        return filter ? `mix test --grep ${sh(filter)} 2>&1` : `mix test 2>&1`;
-      case "cpp":
-        return `make test 2>&1 || ctest 2>&1 || echo "No C++ test runner detected" 1>&2; exit 2`;
-      case "dotnet":
-        return filter ? `dotnet test --filter=${sh(filter)} 2>&1` : `dotnet test 2>&1`;
-      default:
-        return `echo "No test runner detected" 1>&2; exit 2`;
+      case "python": return filter ? `pytest -k ${sh(filter)} -v 2>&1` : `pytest -v 2>&1`;
+      case "go": return filter ? `go test ./... -run ${sh(filter)} -v 2>&1` : `go test ./... 2>&1`;
+      case "rust": return filter ? `cargo test ${sh(filter)} 2>&1` : `cargo test 2>&1`;
+      case "ruby": return filter ? `bundle exec rspec --example ${sh(filter)} 2>&1` : `bundle exec rspec 2>&1`;
+      case "php": return `vendor/bin/phpunit 2>&1 || composer test 2>&1`;
+      case "swift": return filter ? `swift test --filter ${sh(filter)} 2>&1` : `swift test 2>&1`;
+      case "dart": return filter ? `dart test --name=${sh(filter)} 2>&1` : `dart test 2>&1`;
+      case "elixir": return filter ? `mix test --grep ${sh(filter)} 2>&1` : `mix test 2>&1`;
+      case "cpp": return `make test 2>&1 || ctest 2>&1 || echo "No C++ test runner detected" 1>&2; exit 2`;
+      case "dotnet": return filter ? `dotnet test --filter=${sh(filter)} 2>&1` : `dotnet test 2>&1`;
+      default: return `echo "No test runner detected" 1>&2; exit 2`;
     }
   }
 }
