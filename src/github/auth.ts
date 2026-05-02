@@ -1,17 +1,29 @@
 import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/rest";
 import { readFile } from "node:fs/promises";
+import { createPrivateKey } from "node:crypto";
 import { resolve } from "node:path";
 import { logger } from "../utils/logger.js";
 
 async function readPrivateKey(): Promise<string> {
+  let raw: string;
+
   const pathEnv = process.env.GITHUB_APP_PRIVATE_KEY_PATH?.trim();
   if (pathEnv) {
     const absolute = resolve(process.cwd(), pathEnv);
-    return (await readFile(absolute, "utf8")).trim();
+    raw = (await readFile(absolute, "utf8")).trim();
+  } else {
+    raw = (process.env.GITHUB_APP_PRIVATE_KEY ?? "").trim();
+    if (raw.includes("\\n")) raw = raw.replace(/\\n/g, "\n");
   }
-  const raw = process.env.GITHUB_APP_PRIVATE_KEY ?? "";
-  return raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
+
+  // Convert PKCS#1 (RSA PRIVATE KEY) to PKCS#8 so Node 20 / OpenSSL 3 accepts it
+  if (raw.includes("BEGIN RSA PRIVATE KEY")) {
+    const keyObj = createPrivateKey({ key: raw, format: "pem" });
+    return keyObj.export({ type: "pkcs8", format: "pem" }) as string;
+  }
+
+  return raw;
 }
 
 export async function getInstallationToken(installationId: number): Promise<string> {
@@ -23,12 +35,7 @@ export async function getInstallationToken(installationId: number): Promise<stri
     );
   }
 
-  const auth = createAppAuth({
-    appId,
-    privateKey: pk,
-    installationId,
-  });
-
+  const auth = createAppAuth({ appId, privateKey: pk, installationId });
   const { token } = await auth({ type: "installation", installationId });
   return token;
 }
