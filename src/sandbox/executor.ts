@@ -47,10 +47,10 @@ export class SandboxExecutor {
     const authedCloneUrl = `https://x-access-token:${this.githubToken}@github.com/${this.repoOwner}/${this.repoName}.git`;
     const cleanRemoteUrl = `https://github.com/${this.repoOwner}/${this.repoName}.git`;
 
-    await this.sandbox.commands.run("mkdir -p /repo");
-    await this.execChecked(`git clone ${shellSingleQuote(authedCloneUrl)} /repo --depth=50`, 120);
+    await this.sandbox.commands.run("mkdir -p /home/user/repo", { timeoutMs: 10000 });
+    await this.execChecked(`git clone ${shellSingleQuote(authedCloneUrl)} /home/user/repo --depth=50`, 120);
     // Strip token from remote so the LLM can't extract it via git remote -v
-    await this.execChecked(`git -C /repo remote set-url origin ${shellSingleQuote(cleanRemoteUrl)}`, 30);
+    await this.execChecked(`git -C /home/user/repo remote set-url origin ${shellSingleQuote(cleanRemoteUrl)}`, 30);
 
     this.runtime = await this.detectRuntime();
     logger.info({ runtime: this.runtime }, "Runtime detected");
@@ -62,7 +62,7 @@ export class SandboxExecutor {
   async exec(command: string, timeoutSeconds = 60): Promise<ExecResult> {
     if (!this.sandbox) throw new Error("Sandbox not booted");
     const result = await this.sandbox.commands.run(command, {
-      cwd: "/repo",
+      cwd: "/home/user/repo",
       timeoutMs: timeoutSeconds * 1000,
     });
     return {
@@ -92,11 +92,12 @@ export class SandboxExecutor {
     return r;
   }
 
-  /** Resolve a repo-relative path and block traversal outside /repo. */
+  /** Resolve a repo-relative path and block traversal outside /home/user/repo. */
   private resolveRepoPath(relPath: string): string {
     const normalized = relPath.replace(/^\/+/, "").replace(/\\/g, "/");
-    const resolved = path.posix.resolve("/repo", normalized);
-    if (!resolved.startsWith("/repo/") && resolved !== "/repo") {
+    const base = "/home/user/repo";
+    const resolved = path.posix.resolve(base, normalized);
+    if (!resolved.startsWith(base + "/") && resolved !== base) {
       throw new Error(`Path traversal blocked: ${relPath} resolves to ${resolved}`);
     }
     return resolved;
@@ -115,7 +116,7 @@ export class SandboxExecutor {
     }
 
     const resolved = this.resolveRepoPath(relPath);
-    const repoRel = path.posix.relative("/repo", resolved);
+    const repoRel = path.posix.relative("/home/user/repo", resolved);
     this.modifiedFiles.add(repoRel);
 
     await this.sandbox.files.write(resolved, content);
@@ -124,7 +125,7 @@ export class SandboxExecutor {
   /** Remove a file and track it as a modification. */
   async removeFile(relPath: string): Promise<string> {
     const resolved = this.resolveRepoPath(relPath);
-    const repoRel = path.posix.relative("/repo", resolved);
+    const repoRel = path.posix.relative("/home/user/repo", resolved);
     this.modifiedFiles.add(repoRel);
     await this.execForTools(`rm ${shellSingleQuote(resolved)}`);
     return `Removed ${repoRel}`;
@@ -138,7 +139,7 @@ export class SandboxExecutor {
   /** Push a branch to origin without leaking the token in git remote -v. */
   async pushBranch(branchName: string): Promise<void> {
     const pushUrl = `https://x-access-token:${this.githubToken}@github.com/${this.repoOwner}/${this.repoName}.git`;
-    await this.execChecked(`git -C /repo push -u ${shellSingleQuote(pushUrl)} ${shellSingleQuote(branchName)}`, 60);
+    await this.execChecked(`git -C /home/user/repo push -u ${shellSingleQuote(pushUrl)} ${shellSingleQuote(branchName)}`, 60);
   }
 
   async runTests(filter?: string): Promise<TestResult> {
@@ -252,7 +253,7 @@ export class SandboxExecutor {
   }
 
   private async detectRuntime(): Promise<string> {
-    const r = await this.exec("ls /repo");
+    const r = await this.exec("ls /home/user/repo");
     const listing = r.stdout;
     if (listing.includes("package.json")) return "node";
     if (listing.includes("requirements.txt") || listing.includes("pyproject.toml")) return "python";
