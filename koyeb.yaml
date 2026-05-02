@@ -1,0 +1,22 @@
+services:
+  - name: kintsugibot
+    type: web
+    git:
+      repository: github.com/Suh0161/Kintsugibot
+      branch: main
+    build:
+      buildpack: nodejs
+      build_command: npm ci && npm run build
+    run:
+      command: npm start
+    ports:
+      - port: 3000
+        protocol: http
+    health_checks:
+      - path: /health
+        port: 3000
+    env:
+      - key: NODE_ENV
+        value: production
+      - key: RUN_MODE
+        value: both
