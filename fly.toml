@@ -1,0 +1,22 @@
+[app]
+name = "kintsugibot"
+primary_region = "sin" # Singapore — closest to SEA, change to "lax" (US) or "lhr" (EU) if needed
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false  # keep alive to never miss a webhook
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[env]
+  NODE_ENV = "production"
+  RUN_MODE = "both"
+  PORT = "3000"
